@@ -53,6 +53,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        skip_setpgid: bool,
         policy: &SandboxPolicy,
         netns: Option<&NetworkNamespace>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
@@ -63,6 +64,7 @@ impl ProcessHandle {
             args,
             workdir,
             interactive,
+            skip_setpgid,
             policy,
             netns.and_then(NetworkNamespace::ns_fd),
             ca_paths,
@@ -81,6 +83,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        skip_setpgid: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -90,6 +93,7 @@ impl ProcessHandle {
             args,
             workdir,
             interactive,
+            skip_setpgid,
             policy,
             ca_paths,
             provider_env,
@@ -103,6 +107,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        skip_setpgid: bool,
         policy: &SandboxPolicy,
         netns_fd: Option<RawFd>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
@@ -119,8 +124,10 @@ impl ProcessHandle {
         scrub_sensitive_env(&mut cmd);
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = workdir {
-            cmd.current_dir(dir);
+        if let Some(dir) = workdir
+            && let Err(err) = std::fs::metadata(dir)
+        {
+            return Err(miette::miette!("effective workdir metadata failed for {dir}: {err}"));
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -159,40 +166,60 @@ impl ProcessHandle {
         // proper terminal control for shells and interactive programs.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid and setns are async-signal-safe and safe to call in this context.
-        {
-            let policy = policy.clone();
-            let workdir = workdir.map(str::to_string);
-            #[allow(unsafe_code)]
-            unsafe {
-                cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+        let policy = policy.clone();
+        let workdir = workdir.map(str::to_string);
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                if !interactive && !skip_setpgid {
+                    // Create new process group
+                    libc::setpgid(0, 0);
+                }
+
+                // Enter network namespace before applying other restrictions
+                if let Some(fd) = netns_fd {
+                    let result = libc::setns(fd, libc::CLONE_NEWNET);
+                    if result != 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
+                }
 
-                    // Enter network namespace before applying other restrictions
-                    if let Some(fd) = netns_fd {
-                        let result = libc::setns(fd, libc::CLONE_NEWNET);
-                        if result != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                if let Some(ref dir) = workdir {
+                    let c_dir = CString::new(dir.as_str())
+                        .map_err(|err| std::io::Error::other(format!("invalid workdir: {err}")))?;
+                    let result = libc::chdir(c_dir.as_ptr());
+                    if result != 0 {
+                        return Err(std::io::Error::other(format!(
+                            "pre_exec chdir failed for {}: {}",
+                            dir,
+                            std::io::Error::last_os_error()
+                        )));
                     }
+                }
 
-                    // Drop privileges before applying sandbox restrictions.
-                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                    // which may be blocked by Landlock.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                // Drop privileges before applying sandbox restrictions.
+                // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
+                // which may be blocked by Landlock.
+                if let Err(err) = drop_privileges(&policy) {
+                    return Err(std::io::Error::other(format!(
+                        "drop_privileges failed: {err}"
+                    )));
+                }
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                if let Err(err) = sandbox::apply(&policy, workdir.as_deref()) {
+                    return Err(std::io::Error::other(format!(
+                        "sandbox::apply failed: {err}"
+                    )));
+                }
 
-                    Ok(())
-                });
-            }
+                Ok(())
+            });
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let child = cmd
+            .spawn()
+            .into_diagnostic()
+            .map_err(|err| miette::miette!("process spawn failed for program '{program}': {err}"))?;
         let pid = child.id().unwrap_or(0);
         register_managed_child(pid);
 
@@ -207,6 +234,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        skip_setpgid: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -223,6 +251,9 @@ impl ProcessHandle {
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
+            if let Err(err) = std::fs::metadata(dir) {
+                return Err(miette::miette!("effective workdir metadata failed for {dir}: {err}"));
+            }
             cmd.current_dir(dir);
         }
 
@@ -259,7 +290,7 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
+                    if !interactive && !skip_setpgid {
                         // Create new process group
                         libc::setpgid(0, 0);
                     }
@@ -267,18 +298,27 @@ impl ProcessHandle {
                     // Drop privileges before applying sandbox restrictions.
                     // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
                     // which may be blocked by Landlock.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if let Err(err) = drop_privileges(&policy) {
+                        return Err(std::io::Error::other(format!(
+                            "drop_privileges failed: {err}"
+                        )));
+                    }
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if let Err(err) = sandbox::apply(&policy, workdir.as_deref()) {
+                        return Err(std::io::Error::other(format!(
+                            "sandbox::apply failed: {err}"
+                        )));
+                    }
 
                     Ok(())
                 });
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let child = cmd
+            .spawn()
+            .into_diagnostic()
+            .map_err(|err| miette::miette!("process spawn failed for program '{program}': {err}"))?;
         let pid = child.id().unwrap_or(0);
         #[cfg(target_os = "linux")]
         register_managed_child(pid);
@@ -394,6 +434,12 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             .into_diagnostic()?
             .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
     };
+
+    let current_uid = nix::unistd::geteuid();
+    let current_gid = nix::unistd::getegid();
+    if !current_uid.is_root() && current_uid == user.uid && current_gid == group.gid {
+        return Ok(());
+    }
 
     if user_name.is_some() {
         let user_cstr =

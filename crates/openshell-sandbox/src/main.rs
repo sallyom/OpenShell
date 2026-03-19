@@ -27,6 +27,23 @@ struct Args {
     #[arg(long, short)]
     workdir: Option<String>,
 
+    /// Experimental OverlayFS root for a transactional workdir.
+    /// Requires `--workdir` and Linux support.
+    #[arg(long, env = "OPENSHELL_TRANSACTIONAL_WORKSPACE_ROOT")]
+    transactional_workspace_root: Option<String>,
+
+    /// Transactional workspace backend: auto, kernel, or fuse.
+    #[arg(
+        long,
+        env = "OPENSHELL_TRANSACTIONAL_WORKSPACE_BACKEND",
+        default_value = "auto"
+    )]
+    transactional_workspace_backend: String,
+
+    /// Keep the OverlayFS upperdir on exit for inspection.
+    #[arg(long, env = "OPENSHELL_TRANSACTIONAL_WORKSPACE_KEEP_UPPER")]
+    transactional_workspace_keep_upper: bool,
+
     /// Timeout in seconds (0 = no timeout).
     #[arg(long, short, default_value = "0")]
     timeout: u64,
@@ -175,6 +192,9 @@ async fn main() -> Result<()> {
     let exit_code = run_sandbox(
         command,
         args.workdir,
+        args.transactional_workspace_root,
+        args.transactional_workspace_backend,
+        args.transactional_workspace_keep_upper,
         args.timeout,
         args.interactive,
         args.sandbox_id,

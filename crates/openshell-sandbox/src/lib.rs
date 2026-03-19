@@ -21,8 +21,9 @@ pub mod proxy;
 mod sandbox;
 mod secrets;
 mod ssh;
+mod transactional_workspace;
 
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -44,6 +45,10 @@ use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
+use crate::transactional_workspace::{
+    TransactionalWorkspaceBackend, TransactionalWorkspaceConfig,
+    setup as setup_transactional_workspace,
+};
 pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
@@ -52,7 +57,6 @@ pub use process::{ProcessHandle, ProcessStatus};
 /// File-based routes (`--inference-routes`) are loaded once at startup and never
 /// refreshed.
 const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InferenceRouteSource {
     File,
@@ -149,6 +153,9 @@ fn is_managed_child(pid: i32) -> bool {
 pub async fn run_sandbox(
     command: Vec<String>,
     workdir: Option<String>,
+    transactional_workspace_root: Option<String>,
+    transactional_workspace_backend: String,
+    transactional_workspace_keep_upper: bool,
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<String>,
@@ -202,8 +209,34 @@ pub async fn run_sandbox(
         std::collections::HashMap::new()
     };
 
+    let transactional_workspace_backend =
+        TransactionalWorkspaceBackend::parse(&transactional_workspace_backend)?;
+    let transactional_workspace_config =
+        transactional_workspace_root
+            .as_ref()
+            .map(|root| TransactionalWorkspaceConfig {
+                root: root.into(),
+                backend: transactional_workspace_backend,
+                keep_upper: transactional_workspace_keep_upper,
+            });
+    let transactional_workspace = setup_transactional_workspace(
+        workdir.as_deref(),
+        transactional_workspace_config.as_ref(),
+        &policy,
+    )?;
+    let effective_workdir = transactional_workspace
+        .as_ref()
+        .map(|mount| mount.merged_dir().display().to_string())
+        .or(workdir.clone());
+    let skip_setpgid = transactional_workspace
+        .as_ref()
+        .is_some_and(|mount| mount.uses_fuse_backend())
+        && nix::unistd::Uid::effective().as_raw() != 0;
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
     let secret_resolver = secret_resolver.map(Arc::new);
+    if let Some(ref effective_workdir) = effective_workdir {
+        debug!(workdir = %effective_workdir, "Using effective sandbox workdir");
+    }
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -483,7 +516,7 @@ pub async fn run_sandbox(
     if let Some(listen_addr) = ssh_listen_addr {
         let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
         let policy_clone = policy.clone();
-        let workdir_clone = workdir.clone();
+        let ssh_workdir = effective_workdir.clone();
         let secret = ssh_handshake_secret
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
@@ -504,7 +537,7 @@ pub async fn run_sandbox(
                 addr,
                 ssh_ready_tx,
                 policy_clone,
-                workdir_clone,
+                ssh_workdir,
                 secret,
                 ssh_handshake_skew_secs,
                 netns_fd,
@@ -545,8 +578,9 @@ pub async fn run_sandbox(
     let mut handle = ProcessHandle::spawn(
         program,
         args,
-        workdir.as_deref(),
+        effective_workdir.as_deref(),
         interactive,
+        skip_setpgid,
         &policy,
         netns.as_ref(),
         ca_file_paths.as_ref(),
@@ -557,8 +591,9 @@ pub async fn run_sandbox(
     let mut handle = ProcessHandle::spawn(
         program,
         args,
-        workdir.as_deref(),
+        effective_workdir.as_deref(),
         interactive,
+        skip_setpgid,
         &policy,
         ca_file_paths.as_ref(),
         &provider_env,
@@ -636,6 +671,10 @@ pub async fn run_sandbox(
     let status = result.into_diagnostic()?;
 
     info!(exit_code = status.code(), "Process exited");
+
+    if let Some(workspace) = transactional_workspace {
+        workspace.cleanup()?;
+    }
 
     Ok(status.code())
 }
@@ -967,6 +1006,13 @@ async fn load_policy(
             policy_data = %data_file,
             "Loading OPA policy engine from local files"
         );
+        let data_yaml = std::fs::read_to_string(data_file)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read policy data from {data_file}"))?;
+        let network_mode = match local_policy_has_network_policies(&data_yaml)? {
+            true => NetworkMode::Proxy,
+            false => NetworkMode::Block,
+        };
         let engine = OpaEngine::from_files(
             std::path::Path::new(policy_file),
             std::path::Path::new(data_file),
@@ -976,13 +1022,16 @@ async fn load_policy(
             version: 1,
             filesystem: config.filesystem,
             network: NetworkPolicy {
-                mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr: None }),
+                mode: network_mode.clone(),
+                proxy: matches!(network_mode, NetworkMode::Proxy)
+                    .then_some(ProxyPolicy { http_addr: None }),
             },
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        if matches!(network_mode, NetworkMode::Proxy) {
+            enrich_sandbox_baseline_paths(&mut policy);
+        }
         return Ok((policy, Some(Arc::new(engine))));
     }
 
@@ -1052,6 +1101,20 @@ async fn load_policy(
          - --policy-rules and --policy-data (or OPENSHELL_POLICY_RULES and OPENSHELL_POLICY_DATA env vars)\n\
          - --sandbox-id and --openshell-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)"
     ))
+}
+
+fn local_policy_has_network_policies(data_yaml: &str) -> Result<bool> {
+    let value: serde_yaml::Value = serde_yaml::from_str(data_yaml)
+        .into_diagnostic()
+        .wrap_err("failed to parse local policy YAML")?;
+    let Some(network_policies) = value.get("network_policies") else {
+        return Ok(false);
+    };
+    Ok(match network_policies {
+        serde_yaml::Value::Mapping(map) => !map.is_empty(),
+        serde_yaml::Value::Null => false,
+        _ => true,
+    })
 }
 
 /// Try to discover a sandbox policy from the well-known disk path, falling
@@ -1161,6 +1224,7 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 #[cfg(unix)]
 fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     use nix::unistd::{Group, User, chown};
+    use std::os::unix::fs::MetadataExt;
 
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
@@ -1198,6 +1262,7 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     } else {
         None
     };
+    let is_root = nix::unistd::geteuid().as_raw() == 0;
 
     // Create and chown each read_write path.
     //
@@ -1223,7 +1288,16 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         }
 
         debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-        chown(path, uid, gid).into_diagnostic()?;
+        if is_root {
+            chown(path, uid, gid).into_diagnostic()?;
+        } else if let Ok(meta) = std::fs::metadata(path) {
+            debug!(
+                path = %path.display(),
+                owner_uid = meta.uid(),
+                current_uid = nix::unistd::geteuid().as_raw(),
+                "Skipping chown in rootless mode"
+            );
+        }
     }
 
     Ok(())
