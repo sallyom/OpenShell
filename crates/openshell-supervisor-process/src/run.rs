@@ -483,6 +483,7 @@ mod tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            ssh: openshell_core::policy::SshPolicy::default(),
         }
     }
 

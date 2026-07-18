@@ -31,6 +31,16 @@ message SandboxPolicy {
   // policy-local names. At most 10 configs are accepted, and at most 10 stages
   // can be selected per request.
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
+  // SSH forwarding settings. Remote streamlocal forwarding is disabled unless
+  // a dedicated socket root is configured.
+  SshPolicy ssh = 7;
+}
+
+// SSH server settings for the sandbox supervisor.
+message SshPolicy {
+  // Absolute directory beneath which the SSH server accepts remote Unix-socket
+  // forwarding requests. Leave empty to reject remote forwarding.
+  string remote_streamlocal_forward_root = 1;
 }
 
 // Filesystem access policy.

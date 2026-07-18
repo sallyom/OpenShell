@@ -23,11 +23,14 @@ use russh::{ChannelId, CryptoVec};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::net::UnixListener;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Perform SSH server initialization: generate a host key, build the config,
@@ -231,6 +234,11 @@ struct ChannelState {
     pty_request: Option<PtyRequest>,
 }
 
+struct RemoteStreamLocalForward {
+    socket_path: PathBuf,
+    task: JoinHandle<()>,
+}
+
 struct SshHandler {
     policy: SandboxPolicy,
     workdir: Option<String>,
@@ -241,6 +249,7 @@ struct SshHandler {
     user_environment: HashMap<String, String>,
     enforcement_mode: ProcessEnforcementMode,
     channels: HashMap<ChannelId, ChannelState>,
+    remote_streamlocal_forwards: HashMap<String, RemoteStreamLocalForward>,
 }
 
 impl SshHandler {
@@ -265,6 +274,16 @@ impl SshHandler {
             user_environment,
             enforcement_mode,
             channels: HashMap::new(),
+            remote_streamlocal_forwards: HashMap::new(),
+        }
+    }
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        for (_, forward) in self.remote_streamlocal_forwards.drain() {
+            forward.task.abort();
+            let _ = std::fs::remove_file(forward.socket_path);
         }
     }
 }
@@ -377,6 +396,146 @@ impl russh::server::Handler for SshHandler {
             let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut tcp_stream).await;
         });
 
+        Ok(true)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(root) = self.policy.ssh.remote_streamlocal_forward_root.as_deref() else {
+            ocsf_emit!(
+                SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .message("remote streamlocal forwarding is disabled by policy")
+                    .build()
+            );
+            return Ok(false);
+        };
+        let socket_path = match validate_remote_streamlocal_path(root, socket_path) {
+            Ok(path) => path,
+            Err(message) => {
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .message(message)
+                        .build()
+                );
+                return Ok(false);
+            }
+        };
+        let key = socket_path.to_string_lossy().into_owned();
+        if self.remote_streamlocal_forwards.contains_key(&key) {
+            ocsf_emit!(
+                SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .message("remote streamlocal forwarding is already active for this socket")
+                    .build()
+            );
+            return Ok(false);
+        }
+        let directory = match validate_remote_streamlocal_directory(&socket_path) {
+            Ok(directory) => directory,
+            Err(error) => {
+                warn!(path = %socket_path.display(), "remote streamlocal forwarding rejected: {error}");
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .message("remote streamlocal forwarding directory was rejected")
+                        .build()
+                );
+                return Ok(false);
+            }
+        };
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                warn!(path = %socket_path.display(), "failed to bind remote streamlocal forward: {error}");
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .message("failed to bind remote streamlocal forward")
+                        .build()
+                );
+                return Ok(false);
+            }
+        };
+        if let Err(error) = secure_remote_streamlocal_socket(&socket_path, &directory) {
+            let _ = std::fs::remove_file(&socket_path);
+            warn!(path = %socket_path.display(), "failed to secure remote streamlocal forward: {error}");
+            ocsf_emit!(
+                SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Failure)
+                    .message("failed to secure remote streamlocal forward")
+                    .build()
+            );
+            return Ok(false);
+        }
+        let handle = session.handle();
+        let task_socket_path = socket_path.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handle = handle.clone();
+                let channel_socket_path = task_socket_path.clone();
+                tokio::spawn(async move {
+                    let Ok(channel) = handle
+                        .channel_open_forwarded_streamlocal(
+                            channel_socket_path.to_string_lossy().into_owned(),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    let mut channel = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut channel).await;
+                });
+            }
+            let _ = std::fs::remove_file(task_socket_path);
+        });
+        self.remote_streamlocal_forwards
+            .insert(key, RemoteStreamLocalForward { socket_path, task });
+        ocsf_emit!(
+            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Listen)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .message("remote streamlocal forward listening")
+                .build()
+        );
+        Ok(true)
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let key = socket_path.to_string();
+        let Some(forward) = self.remote_streamlocal_forwards.remove(&key) else {
+            return Ok(false);
+        };
+        forward.task.abort();
+        let _ = std::fs::remove_file(forward.socket_path);
         Ok(true)
     }
 
@@ -555,6 +714,81 @@ impl russh::server::Handler for SshHandler {
         }
         Ok(())
     }
+}
+
+fn validate_remote_streamlocal_path(root: &Path, socket_path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(socket_path);
+    let Some(directory) = path.parent() else {
+        return Err("remote streamlocal forwarding requires a socket directory".to_string());
+    };
+    let Some(forward_id) = directory.file_name().and_then(|value| value.to_str()) else {
+        return Err("remote streamlocal forwarding requires an ASCII directory name".to_string());
+    };
+    let Some(socket_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Err("remote streamlocal forwarding requires an ASCII socket name".to_string());
+    };
+    let permitted_component = |component: &str| {
+        !component.is_empty()
+            && component.len() <= 128
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    if !root.is_absolute()
+        || !path.is_absolute()
+        || directory.parent() != Some(root)
+        || !permitted_component(forward_id)
+        || !permitted_component(socket_name)
+    {
+        return Err("remote streamlocal forwarding path is outside its policy root".to_string());
+    }
+    Ok(path)
+}
+
+fn validate_remote_streamlocal_directory(socket_path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let directory = socket_path
+        .parent()
+        .expect("validated remote socket path has a parent");
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "remote forwarding directory is not a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(
+            "remote forwarding directory is not owner-private",
+        ));
+    }
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "remote forwarding socket already exists",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(metadata),
+        Err(error) => Err(error),
+    }
+}
+
+fn secure_remote_streamlocal_socket(
+    socket_path: &Path,
+    directory: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+        let metadata = std::fs::metadata(socket_path)?;
+        if metadata.uid() != directory.uid() || metadata.gid() != directory.gid() {
+            nix::unistd::chown(
+                socket_path,
+                Some(nix::unistd::Uid::from_raw(directory.uid())),
+                Some(nix::unistd::Gid::from_raw(directory.gid())),
+            )
+            .map_err(std::io::Error::other)?;
+        }
+    }
+    Ok(())
 }
 
 impl SshHandler {
@@ -1389,6 +1623,49 @@ mod tests {
         drop(listener);
     }
 
+    #[test]
+    fn remote_streamlocal_forward_requires_a_private_child_of_its_policy_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("forwards");
+        let directory = root.join("worker-123");
+        std::fs::create_dir_all(&directory).unwrap();
+        set_file_mode(&directory, 0o700);
+        let socket = directory.join("agent.sock");
+
+        assert_eq!(
+            validate_remote_streamlocal_path(&root, socket.to_str().unwrap()).unwrap(),
+            socket
+        );
+        assert!(validate_remote_streamlocal_directory(&socket).is_ok());
+
+        let outside = temp.path().join("outside").join("agent.sock");
+        assert!(validate_remote_streamlocal_path(&root, outside.to_str().unwrap()).is_err());
+
+        set_file_mode(&directory, 0o755);
+        assert!(validate_remote_streamlocal_directory(&socket).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn remote_streamlocal_forward_socket_is_owner_private() {
+        let temp = tempfile::Builder::new()
+            .prefix("openshell-ssh-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = temp.path().join("forwards");
+        let directory = root.join("worker-123");
+        std::fs::create_dir_all(&directory).unwrap();
+        set_file_mode(&directory, 0o700);
+        let socket = directory.join("agent.sock");
+        let metadata = validate_remote_streamlocal_directory(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        secure_remote_streamlocal_socket(&socket, &metadata).unwrap();
+        assert_eq!(file_mode(&socket), 0o600);
+
+        drop(listener);
+    }
+
     /// Verify that dropping the input sender (the operation `channel_eof`
     /// performs) causes the stdin writer loop to exit and close the child's
     /// stdin pipe.  Without this, commands like `cat | tar xf -` used by
@@ -1667,6 +1944,7 @@ mod tests {
                 run_as_user: Some("1000".into()),
                 run_as_group: None,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "1000");
@@ -1688,6 +1966,7 @@ mod tests {
                 run_as_user: Some("sandbox".into()),
                 run_as_group: None,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
@@ -1709,6 +1988,7 @@ mod tests {
                 run_as_user: Some(String::new()),
                 run_as_group: None,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
@@ -1729,6 +2009,7 @@ mod tests {
                 run_as_user: None,
                 run_as_group: None,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
@@ -1749,6 +2030,7 @@ mod tests {
                 run_as_user: Some("1000660000".into()),
                 run_as_group: None,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "1000660000");
@@ -1778,6 +2060,7 @@ mod tests {
                 run_as_user: None,
                 run_as_group: None,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
 
         // Skip if running as root: drop_privileges would try to switch to
@@ -1808,6 +2091,7 @@ mod tests {
                             run_as_user: None,
                             run_as_group: None,
                         },
+                        ssh: openshell_core::policy::SshPolicy::default(),
                     },
                     None,
                 )

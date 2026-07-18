@@ -18,6 +18,7 @@ pub struct SandboxPolicy {
     pub network: NetworkPolicy,
     pub landlock: LandlockPolicy,
     pub process: ProcessPolicy,
+    pub ssh: SshPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,12 @@ pub struct ProcessPolicy {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct SshPolicy {
+    /// Absolute root for policy-authorized remote Unix-socket forwarding.
+    pub remote_streamlocal_forward_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub enum LandlockCompatibility {
     #[default]
     BestEffort,
@@ -116,6 +123,7 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
             network,
             landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
+            ssh: proto.ssh.map(SshPolicy::from).unwrap_or_default(),
         })
     }
 }
@@ -162,6 +170,15 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
             } else {
                 Some(proto.run_as_group)
             },
+        }
+    }
+}
+
+impl From<crate::proto::SshPolicy> for SshPolicy {
+    fn from(proto: crate::proto::SshPolicy) -> Self {
+        Self {
+            remote_streamlocal_forward_root: (!proto.remote_streamlocal_forward_root.is_empty())
+                .then(|| PathBuf::from(normalize_path(&proto.remote_streamlocal_forward_root))),
         }
     }
 }

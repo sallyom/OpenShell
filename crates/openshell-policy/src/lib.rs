@@ -21,7 +21,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    SandboxPolicy, SshPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,8 @@ struct PolicyFile {
     landlock: Option<LandlockDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process: Option<ProcessDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh: Option<SshDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -82,6 +84,13 @@ struct ProcessDef {
     run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     run_as_group: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    remote_streamlocal_forward_root: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -785,6 +794,9 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
             run_as_user: p.run_as_user,
             run_as_group: p.run_as_group,
         }),
+        ssh: raw.ssh.map(|ssh| SshPolicy {
+            remote_streamlocal_forward_root: ssh.remote_streamlocal_forward_root,
+        }),
         network_policies,
         network_middlewares,
     })
@@ -920,12 +932,18 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         .collect();
 
     let network_middlewares = middleware::from_proto(&policy.network_middlewares);
+    let ssh = policy.ssh.as_ref().and_then(|ssh| {
+        (!ssh.remote_streamlocal_forward_root.is_empty()).then(|| SshDef {
+            remote_streamlocal_forward_root: ssh.remote_streamlocal_forward_root.clone(),
+        })
+    });
 
     PolicyFile {
         version: policy.version,
         filesystem_policy,
         landlock,
         process,
+        ssh,
         network_policies,
         network_middlewares,
     }
@@ -1079,6 +1097,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         }),
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
+        ssh: None,
     }
 }
 
@@ -1355,6 +1374,29 @@ pub fn validate_sandbox_policy(
         }
     }
 
+    if let Some(ssh) = &policy.ssh {
+        let root = &ssh.remote_streamlocal_forward_root;
+        if !root.is_empty() {
+            if root.len() > MAX_PATH_LENGTH {
+                violations.push(PolicyViolation::FieldTooLong {
+                    path: truncate_for_display(root),
+                    length: root.len(),
+                });
+            } else {
+                let path = Path::new(root);
+                if !path.has_root() {
+                    violations.push(PolicyViolation::RelativePath { path: root.clone() });
+                }
+                if path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    violations.push(PolicyViolation::PathTraversal { path: root.clone() });
+                }
+            }
+        }
+    }
+
     // Check network policy endpoint hosts for TLD wildcards.
     for (key, rule) in &policy.network_policies {
         let name = if rule.name.is_empty() {
@@ -1498,6 +1540,28 @@ network_policies:
         assert_eq!(json["version"], serde_json::json!(1));
         assert!(json.get("filesystem").is_none());
         assert!(json.get("network_policies").is_some());
+    }
+
+    #[test]
+    fn round_trip_preserves_remote_streamlocal_forward_root() {
+        let yaml = r"
+version: 1
+ssh:
+  remote_streamlocal_forward_root: /tmp
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        assert_eq!(
+            proto1
+                .ssh
+                .as_ref()
+                .expect("ssh policy")
+                .remote_streamlocal_forward_root,
+            "/tmp"
+        );
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto1.ssh, proto2.ssh);
     }
 
     /// Verify that `allowed_ips` survives the round-trip.
@@ -2333,6 +2397,7 @@ network_policies:
             process: None,
             filesystem: None,
             landlock: None,
+            ssh: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };
@@ -2783,6 +2848,7 @@ network_policies:
             }),
             filesystem: None,
             landlock: None,
+            ssh: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };
@@ -2799,6 +2865,7 @@ network_policies:
             }),
             filesystem: None,
             landlock: None,
+            ssh: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };
@@ -2878,6 +2945,7 @@ network_policies:
             }),
             filesystem: None,
             landlock: None,
+            ssh: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };

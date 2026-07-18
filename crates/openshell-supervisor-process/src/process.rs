@@ -1553,6 +1553,7 @@ mod tests {
             network: NetworkPolicy::default(),
             landlock: LandlockPolicy::default(),
             process,
+            ssh: openshell_core::policy::SshPolicy::default(),
         }
     }
 
@@ -1994,6 +1995,7 @@ mod tests {
                 run_as_user,
                 run_as_group,
             },
+            ssh: openshell_core::policy::SshPolicy::default(),
         }
     }
 

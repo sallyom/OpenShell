@@ -10,7 +10,7 @@
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
 use openshell_core::policy::{
-    FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
+    FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy, SshPolicy,
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::L7ConfigStanza;
@@ -111,6 +111,7 @@ pub struct SandboxConfig {
     pub filesystem: FilesystemPolicy,
     pub landlock: LandlockPolicy,
     pub process: ProcessPolicy,
+    pub ssh: SshPolicy,
 }
 
 /// Embedded OPA policy engine.
@@ -608,7 +609,7 @@ impl OpaEngine {
 
     /// Query static sandbox configuration from the OPA data module.
     ///
-    /// Extracts `filesystem_policy`, `landlock`, and `process` from the Rego
+    /// Extracts `filesystem_policy`, `landlock`, `process`, and `ssh` from the Rego
     /// data and converts them into the Rust policy structs used by the sandbox
     /// runtime for filesystem preparation, Landlock setup, and privilege dropping.
     pub fn query_sandbox_config(&self) -> Result<SandboxConfig> {
@@ -635,10 +636,16 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         let process = parse_process_policy(&proc_val);
 
+        let ssh_val = engine
+            .eval_rule("data.openshell.sandbox.ssh_policy".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        let ssh = parse_ssh_policy(&ssh_val);
+
         Ok(SandboxConfig {
             filesystem,
             landlock,
             process,
+            ssh,
         })
     }
 
@@ -1020,6 +1027,13 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     ProcessPolicy {
         run_as_user: get_str(val, "run_as_user"),
         run_as_group: get_str(val, "run_as_group"),
+    }
+}
+
+fn parse_ssh_policy(val: &regorus::Value) -> SshPolicy {
+    SshPolicy {
+        remote_streamlocal_forward_root: get_str(val, "remote_streamlocal_forward_root")
+            .map(PathBuf::from),
     }
 }
 
@@ -1439,6 +1453,7 @@ fn l7_matchers_to_json(
 /// - `data.filesystem_policy`
 /// - `data.landlock`
 /// - `data.process`
+/// - `data.ssh`
 /// - `data.network_policies`
 ///
 /// When `entrypoint_pid` is non-zero, binary paths that are symlinks inside
@@ -1481,6 +1496,15 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             serde_json::json!({
                 "run_as_user": p.run_as_user,
                 "run_as_group": p.run_as_group,
+            })
+        },
+    );
+
+    let ssh = proto.ssh.as_ref().map_or_else(
+        || serde_json::json!({"remote_streamlocal_forward_root": ""}),
+        |ssh| {
+            serde_json::json!({
+                "remote_streamlocal_forward_root": ssh.remote_streamlocal_forward_root,
             })
         },
     );
@@ -1719,6 +1743,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         "filesystem_policy": filesystem_policy,
         "landlock": landlock,
         "process": process,
+        "ssh": ssh,
         "network_policies": network_policies,
         "network_middlewares": network_middlewares,
     })
@@ -1739,7 +1764,7 @@ mod tests {
     use openshell_core::proto::{
         FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
-        SandboxPolicy as ProtoSandboxPolicy,
+        SandboxPolicy as ProtoSandboxPolicy, SshPolicy as ProtoSsh,
     };
 
     const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
@@ -1802,6 +1827,7 @@ mod tests {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
@@ -1994,6 +2020,20 @@ mod tests {
         let config = engine.query_sandbox_config().unwrap();
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
+    }
+
+    #[test]
+    fn from_proto_extracts_ssh_policy() {
+        let mut proto = test_proto();
+        proto.ssh = Some(ProtoSsh {
+            remote_streamlocal_forward_root: "/tmp".to_string(),
+        });
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+        let config = engine.query_sandbox_config().unwrap();
+        assert_eq!(
+            config.ssh.remote_streamlocal_forward_root,
+            Some(PathBuf::from("/tmp"))
+        );
     }
 
     #[test]
@@ -2720,6 +2760,7 @@ process:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -3263,6 +3304,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -3335,6 +3377,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -3408,6 +3451,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -4340,6 +4384,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -4398,6 +4443,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -4457,6 +4503,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -4518,6 +4565,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -4578,6 +4626,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -5568,6 +5617,7 @@ process:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -5623,6 +5673,7 @@ process:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -5694,6 +5745,7 @@ process:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };
@@ -5925,6 +5977,7 @@ network_policies:
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ssh: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         };

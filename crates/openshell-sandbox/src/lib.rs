@@ -1702,6 +1702,7 @@ mod baseline_tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            ssh: openshell_core::policy::SshPolicy::default(),
         };
 
         enrich_sandbox_baseline_paths(&mut policy);
@@ -1870,6 +1871,7 @@ async fn load_policy(
             },
             landlock: config.landlock,
             process: config.process,
+            ssh: config.ssh,
         };
         enrich_sandbox_baseline_paths(&mut policy);
         // File mode has no operator-registered middleware to connect.
@@ -3072,6 +3074,7 @@ mod tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            ssh: openshell_core::policy::SshPolicy::default(),
         }
     }
 

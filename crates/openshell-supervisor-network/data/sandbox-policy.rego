@@ -13,6 +13,8 @@ landlock_policy := data.landlock
 
 process_policy := data.process
 
+ssh_policy := data.ssh
+
 # --- Network access decision (queried per-CONNECT request) ---
 
 allow_network if {
