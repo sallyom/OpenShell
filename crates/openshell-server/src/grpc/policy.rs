@@ -1272,7 +1272,12 @@ pub(super) async fn handle_get_sandbox_config(
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    if !matches!(
+        &principal,
+        Principal::Sandbox(parent) if parent.sandbox_id != sandbox_id
+    ) {
+        crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    }
     drop(request);
 
     let sandbox =

@@ -18,7 +18,7 @@ use openshell_bootstrap::{
 };
 use openshell_cli::completers;
 use openshell_cli::run;
-use openshell_cli::tls::TlsOptions;
+use openshell_cli::tls::{TlsOptions, sandbox_token_from_environment};
 use openshell_core::proto::GpuResourceRequirements;
 
 /// Resolved gateway context: name + gateway endpoint.
@@ -163,6 +163,9 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
 /// Apply stored authentication and return a user-facing preparation failure,
 /// if the CLI already knows the credentials cannot be used.
 fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<String> {
+    if let Some(token) = sandbox_token_from_environment() {
+        tls.oidc_token = Some(token);
+    }
     let meta = get_gateway_metadata(gateway_name)?;
     match meta.auth_mode.as_deref() {
         Some("cloudflare_jwt") => {
@@ -1431,6 +1434,10 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Create this sandbox as a delegated child of the calling sandbox.
+        #[arg(long)]
+        parent_sandbox_id: Option<String>,
+
         /// Environment variables to inject into the sandbox (KEY=VALUE format, repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
@@ -2154,6 +2161,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut tls = TlsOptions::default();
     tls.gateway_insecure = cli.gateway_insecure;
+    // Worker providers may supply a short-lived OIDC token directly rather
+    // than registering gateway metadata in the CLI config directory. Seed the
+    // request auth state before command dispatch so explicit
+    // --gateway-endpoint calls carry the bearer token too.
+    if let Some(token) = sandbox_token_from_environment() {
+        tls.oidc_token = Some(token);
+    }
 
     // Set up logging based on verbosity
     let log_level = match cli.verbose {
@@ -2927,6 +2941,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    parent_sandbox_id,
                     envs,
                     approval_mode,
                     output,
@@ -3014,6 +3029,7 @@ async fn main() -> Result<()> {
                             tty_override,
                             auto_providers_override,
                             labels: labels_map,
+                            parent_sandbox_id: parent_sandbox_id.as_deref(),
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),

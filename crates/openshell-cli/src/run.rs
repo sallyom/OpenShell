@@ -379,6 +379,7 @@ pub struct SandboxCreateConfig<'a> {
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
     pub labels: HashMap<String, String>,
+    pub parent_sandbox_id: Option<&'a str>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
     pub output: &'a str,
@@ -403,6 +404,7 @@ impl Default for SandboxCreateConfig<'_> {
             tty_override: None,
             auto_providers_override: None,
             labels: HashMap::new(),
+            parent_sandbox_id: None,
             environment: HashMap::new(),
             approval_mode: "manual",
             output: "table",
@@ -435,6 +437,7 @@ pub async fn sandbox_create(
         tty_override,
         auto_providers_override,
         labels,
+        parent_sandbox_id,
         environment,
         approval_mode,
         output,
@@ -480,26 +483,35 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let inferred_provider = inferred_provider_type(command);
-    let providers_v2_enabled =
-        if inferred_provider.is_some() && auto_providers_override != Some(false) {
-            gateway_providers_v2_enabled(&mut client).await?
-        } else {
-            false
-        };
-    let inferred_types: Vec<String> = if providers_v2_enabled {
+    let configured_providers = if parent_sandbox_id.is_some() {
+        if !providers.is_empty() {
+            return Err(miette::miette!(
+                "delegated child creation cannot attach providers from the parent sandbox"
+            ));
+        }
         Vec::new()
     } else {
-        inferred_provider.into_iter().collect()
+        let inferred_provider = inferred_provider_type(command);
+        let providers_v2_enabled =
+            if inferred_provider.is_some() && auto_providers_override != Some(false) {
+                gateway_providers_v2_enabled(&mut client).await?
+            } else {
+                false
+            };
+        let inferred_types: Vec<String> = if providers_v2_enabled {
+            Vec::new()
+        } else {
+            inferred_provider.into_iter().collect()
+        };
+        ensure_required_providers(
+            &mut client,
+            providers,
+            &inferred_types,
+            auto_providers_override,
+            workspace,
+        )
+        .await?
     };
-    let configured_providers = ensure_required_providers(
-        &mut client,
-        providers,
-        &inferred_types,
-        auto_providers_override,
-        workspace,
-    )
-    .await?;
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
@@ -533,6 +545,7 @@ pub async fn sandbox_create(
         labels,
         annotations: HashMap::new(),
         workspace: workspace.to_string(),
+        parent_sandbox_id: parent_sandbox_id.unwrap_or_default().to_string(),
     };
 
     let response = match client.create_sandbox(request).await {

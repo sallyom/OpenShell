@@ -67,6 +67,9 @@ pub enum SandboxIdentitySource {
     /// Gateway-minted JWT validated against the gateway's signing key.
     /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
     BootstrapJwt { issuer: String },
+    /// Gateway-minted JWT restricted to managing delegated children of this
+    /// sandbox. It cannot renew itself or call supervisor-only APIs.
+    DelegationJwt { issuer: String },
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },

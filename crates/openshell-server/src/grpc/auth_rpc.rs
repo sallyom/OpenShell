@@ -7,6 +7,7 @@
 //! - `GetCurrentUser` — report the gateway-validated caller identity
 //! - `IssueSandboxToken` — bootstrap exchange (K8s SA token → gateway JWT)
 //! - `RefreshSandboxToken` — renew a still-valid gateway JWT
+//! - `IssueDelegationToken` — mint a restricted child-management credential
 //!
 //! Both end in a fresh gateway-signed JWT minted by
 //! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Older tokens remain valid
@@ -16,8 +17,9 @@ use crate::ServerState;
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
-    GetCurrentUserRequest, GetCurrentUserResponse, IssueSandboxTokenRequest,
-    IssueSandboxTokenResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
+    GetCurrentUserRequest, GetCurrentUserResponse, IssueDelegationTokenRequest,
+    IssueDelegationTokenResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -155,6 +157,38 @@ pub async fn handle_refresh_sandbox_token(
     }))
 }
 
+#[allow(clippy::result_large_err, clippy::unused_async)]
+pub async fn handle_issue_delegation_token(
+    state: &Arc<ServerState>,
+    request: Request<IssueDelegationTokenRequest>,
+) -> Result<Response<IssueDelegationTokenResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
+    let Principal::Sandbox(sandbox) = principal else {
+        return Err(Status::permission_denied(
+            "IssueDelegationToken requires a sandbox principal",
+        ));
+    };
+    let SandboxIdentitySource::BootstrapJwt { .. } = &sandbox.source else {
+        return Err(Status::permission_denied(
+            "only a full gateway sandbox credential may mint a delegation token",
+        ));
+    };
+    let issuer = state.sandbox_jwt_issuer.as_ref().ok_or_else(|| {
+        Status::unavailable("sandbox JWT minting is not configured on this gateway")
+    })?;
+    ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+    let minted = issuer.mint_delegation(&sandbox.sandbox_id)?;
+    info!(sandbox_id = %sandbox.sandbox_id, "issued sandbox delegation JWT");
+    Ok(Response::new(IssueDelegationTokenResponse {
+        token: minted.token,
+        expires_at_ms: minted.expires_at_ms,
+    }))
+}
+
 async fn ensure_sandbox_exists(state: &Arc<ServerState>, sandbox_id: &str) -> Result<(), Status> {
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -255,6 +289,16 @@ mod tests {
         })
     }
 
+    fn delegation_principal(sandbox_id: &str) -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::DelegationJwt {
+                issuer: "openshell-gateway:test-gateway".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
+
     #[tokio::test]
     async fn current_user_returns_gateway_validated_identity() {
         let mut req = Request::new(GetCurrentUserRequest {});
@@ -290,6 +334,31 @@ mod tests {
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expires_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn issue_delegation_returns_restricted_token_for_existing_sandbox() {
+        let state = state_with_issuer().await;
+        let mut req = Request::new(IssueDelegationTokenRequest {});
+        req.extensions_mut().insert(sandbox_principal("sandbox-a"));
+        let response = handle_issue_delegation_token(&state, req)
+            .await
+            .expect("delegation issue OK")
+            .into_inner();
+        assert!(!response.token.is_empty());
+        assert!(response.expires_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn delegation_token_cannot_mint_another_delegation_token() {
+        let state = state_with_issuer().await;
+        let mut req = Request::new(IssueDelegationTokenRequest {});
+        req.extensions_mut()
+            .insert(delegation_principal("sandbox-a"));
+        let error = handle_issue_delegation_token(&state, req)
+            .await
+            .expect_err("delegation token must not mint another token");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

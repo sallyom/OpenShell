@@ -632,6 +632,7 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 "source".to_string(),
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
+                    SandboxIdentitySource::DelegationJwt { .. } => "delegation_jwt",
                     SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
                     SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
                 }
@@ -1045,8 +1046,14 @@ where
                         return Ok(status_response(status));
                     }
                 }
-                Principal::Sandbox(_) => {
-                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
+                Principal::Sandbox(ref sandbox) => {
+                    let allowed = match sandbox.source {
+                        crate::auth::principal::SandboxIdentitySource::DelegationJwt { .. } => {
+                            crate::auth::delegation_methods::is_delegation_callable(&path)
+                        }
+                        _ => crate::auth::sandbox_methods::is_sandbox_callable(&path),
+                    };
+                    if !allowed {
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
                         )));
@@ -2387,6 +2394,16 @@ mod tests {
             })
         }
 
+        fn delegation_principal() -> Principal {
+            Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::DelegationJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            })
+        }
+
         #[tokio::test]
         async fn mtls_peer_identity_fills_missing_principal_when_enabled() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
@@ -2642,6 +2659,31 @@ mod tests {
 
                 assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
                 assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+            }
+        }
+
+        #[tokio::test]
+        async fn delegation_principal_reaches_only_child_management_methods() {
+            for (path, expected_status) in [
+                ("/openshell.v1.OpenShell/CreateSandbox", None),
+                ("/openshell.v1.OpenShell/ForwardTcp", None),
+                ("/openshell.v1.OpenShell/RefreshSandboxToken", Some("7")),
+                ("/openshell.v1.OpenShell/ListSandboxes", Some("7")),
+            ] {
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                    delegation_principal(),
+                ))));
+                let chain = AuthenticatorChain::new(vec![mock]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                let response = router.call(empty_request(path)).await.unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), expected_status, "{path}");
+                assert_eq!(
+                    seen.lock().unwrap().is_some(),
+                    expected_status.is_none(),
+                    "{path}"
+                );
             }
         }
 

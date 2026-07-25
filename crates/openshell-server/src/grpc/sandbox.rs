@@ -58,6 +58,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const DELEGATED_PARENT_SANDBOX_LABEL: &str = "openshell.nvidia.com/parent-sandbox-id";
 
 /// Fetch a sandbox by ID and authorize the caller in one step, returning
 /// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
@@ -73,21 +74,27 @@ pub(super) async fn fetch_and_authorize_sandbox(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await
-    .map_err(|e| {
-        if e.code() == tonic::Code::PermissionDenied {
-            Status::not_found("sandbox not found")
-        } else {
-            e
-        }
-    })?;
+    if let crate::auth::principal::Principal::Sandbox(parent) = principal
+        && parent.sandbox_id != sandbox_id
+    {
+        ensure_delegated_child(state, parent, &sandbox).await?;
+    } else {
+        authorize_sandbox_workspace(
+            &state.store,
+            &state.admin_role,
+            principal,
+            sandbox.object_workspace(),
+            MinWorkspaceRole::User,
+        )
+        .await
+        .map_err(|e| {
+            if e.code() == tonic::Code::PermissionDenied {
+                Status::not_found("sandbox not found")
+            } else {
+                e
+            }
+        })?;
+    }
     Ok(sandbox)
 }
 
@@ -175,22 +182,73 @@ async fn handle_create_sandbox_inner(
 
     // Validate labels (keys and values must meet Kubernetes requirements).
     for (key, value) in &request.labels {
+        if key == DELEGATED_PARENT_SANDBOX_LABEL {
+            return Err(Status::invalid_argument(
+                "parent-sandbox-id is server-managed",
+            ));
+        }
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        &request.workspace,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .ensure_active()?;
+    let delegated_parent = if request.parent_sandbox_id.is_empty() {
+        None
+    } else {
+        let crate::auth::principal::Principal::Sandbox(parent) = &principal else {
+            return Err(Status::permission_denied(
+                "only a sandbox may create a delegated child",
+            ));
+        };
+        if request.parent_sandbox_id != parent.sandbox_id {
+            return Err(Status::permission_denied(
+                "parent sandbox does not match caller identity",
+            ));
+        }
+        let parent_sandbox = state
+            .store
+            .get_message::<Sandbox>(&parent.sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+            .ok_or_else(|| Status::permission_denied("parent sandbox not found"))?;
+        if parent_sandbox.object_workspace() != request.workspace {
+            return Err(Status::permission_denied(
+                "delegated child must stay in the parent workspace",
+            ));
+        }
+        Some(parent_sandbox)
+    };
+    let parent_sandbox_id = delegated_parent
+        .as_ref()
+        .map(|parent| parent.object_id().to_string());
+    let workspace = if parent_sandbox_id.is_some() {
+        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+            .await?
+            .ensure_active()?
+    } else {
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &request.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .ensure_active()?
+    };
+    if parent_sandbox_id.is_some() && !spec.providers.is_empty() {
+        return Err(Status::permission_denied(
+            "delegated child creation cannot attach providers",
+        ));
+    }
+
+    let mut spec = if let Some(parent) = delegated_parent.as_ref() {
+        delegated_child_spec(parent)?
+    } else {
+        spec
+    };
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -211,7 +269,6 @@ async fn handle_create_sandbox_inner(
         .await?;
 
     // Ensure the template always carries the resolved image.
-    let mut spec = spec;
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();
@@ -235,12 +292,19 @@ async fn handle_create_sandbox_inner(
 
     let now_ms = current_time_ms();
 
+    let mut labels = request.labels.clone();
+    if let Some(parent_sandbox_id) = parent_sandbox_id {
+        labels.insert(
+            DELEGATED_PARENT_SANDBOX_LABEL.to_string(),
+            parent_sandbox_id,
+        );
+    }
     let mut sandbox = Sandbox {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: id.clone(),
             name: name.clone(),
             created_at_ms: now_ms,
-            labels: request.labels.clone(),
+            labels,
             resource_version: 0,
             annotations: request.annotations.clone(),
             workspace,
@@ -295,6 +359,24 @@ async fn handle_create_sandbox_inner(
     }))
 }
 
+fn delegated_child_spec(parent: &Sandbox) -> Result<openshell_core::proto::SandboxSpec, Status> {
+    let mut spec = parent
+        .spec
+        .clone()
+        .ok_or_else(|| Status::permission_denied("parent sandbox has no specification"))?;
+    // The parent authorizes the child shape. The workload may name a child but
+    // cannot select a different image, policy, resources, or another delegation chain.
+    spec.providers.clear();
+    spec.environment
+        .remove(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE);
+    if let Some(template) = spec.template.as_mut() {
+        template
+            .environment
+            .remove(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE);
+    }
+    Ok(spec)
+}
+
 pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
@@ -304,17 +386,23 @@ pub(super) async fn handle_get_sandbox(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        &req.workspace,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
+    let workspace = if matches!(principal, crate::auth::principal::Principal::Sandbox(_)) {
+        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name
+    } else {
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &req.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name
+    };
 
     let sandbox = state
         .store
@@ -323,6 +411,9 @@ pub(super) async fn handle_get_sandbox(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
     let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if let crate::auth::principal::Principal::Sandbox(parent) = &principal {
+        ensure_delegated_child(state, parent, &sandbox).await?;
+    }
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -661,17 +752,27 @@ async fn handle_delete_sandbox_inner(
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        &req.workspace,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
+    let workspace = if matches!(principal, crate::auth::principal::Principal::Sandbox(_)) {
+        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name
+    } else {
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &req.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name
+    };
+    if let crate::auth::principal::Principal::Sandbox(parent) = &principal {
+        let sandbox = sandbox_by_name(state, &workspace, &name).await?;
+        ensure_delegated_child(state, parent, &sandbox).await?;
+    }
 
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
@@ -1196,6 +1297,35 @@ async fn acquire_forward_connection_guard(
     })
 }
 
+#[allow(clippy::result_large_err)]
+pub(super) async fn ensure_delegated_child(
+    state: &Arc<ServerState>,
+    parent: &crate::auth::principal::SandboxPrincipal,
+    child: &Sandbox,
+) -> Result<(), Status> {
+    let metadata = child
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::permission_denied("delegated child sandbox has no metadata"))?;
+    if metadata.labels.get(DELEGATED_PARENT_SANDBOX_LABEL) != Some(&parent.sandbox_id) {
+        return Err(Status::permission_denied(
+            "delegated relay requires a child sandbox owned by the calling sandbox",
+        ));
+    }
+    let parent_sandbox = state
+        .store
+        .get_message::<Sandbox>(&parent.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .ok_or_else(|| Status::permission_denied("parent sandbox not found"))?;
+    if parent_sandbox.object_workspace() != child.object_workspace() {
+        return Err(Status::permission_denied(
+            "delegated relay cannot cross workspace boundaries",
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_ssh_forward_token(
     state: &Arc<ServerState>,
     token: &str,
@@ -1600,21 +1730,9 @@ pub(super) async fn handle_revoke_ssh_session(
     let Some(mut session) = session else {
         return Ok(Response::new(RevokeSshSessionResponse { revoked: false }));
     };
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        session.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await
-    .map_err(|e| {
-        if e.code() == tonic::Code::PermissionDenied {
-            Status::not_found("sandbox not found")
-        } else {
-            e
-        }
-    })?;
+    // A delegation credential is scoped to its parent's children, not the
+    // whole workspace. Resolve the SSH session's sandbox before revoking it.
+    let _sandbox = fetch_and_authorize_sandbox(state, &principal, &session.sandbox_id).await?;
 
     let resource_version = session
         .metadata
@@ -2216,6 +2334,7 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::principal::Principal;
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_driver,
     };
@@ -2566,6 +2685,141 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    #[test]
+    fn delegated_child_inherits_parent_execution_boundary() {
+        let mut parent = test_sandbox("delegating-parent", vec!["provider-a".to_string()]);
+        let parent_spec = parent.spec.as_mut().expect("parent sandbox has a spec");
+        parent_spec.environment.insert(
+            openshell_core::sandbox_env::DELEGATION_TOKEN_FILE.to_string(),
+            openshell_core::sandbox_env::DELEGATION_TOKEN_PATH.to_string(),
+        );
+        parent_spec.template = Some(SandboxTemplate {
+            image: "registry.example.test/openclaw:parent".to_string(),
+            environment: HashMap::from([(
+                openshell_core::sandbox_env::DELEGATION_TOKEN_FILE.to_string(),
+                openshell_core::sandbox_env::DELEGATION_TOKEN_PATH.to_string(),
+            )]),
+            ..Default::default()
+        });
+
+        let mut expected = parent.spec.clone().expect("parent sandbox has a spec");
+        expected.providers.clear();
+        expected
+            .environment
+            .remove(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE);
+        expected
+            .template
+            .as_mut()
+            .expect("parent template is retained")
+            .environment
+            .remove(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE);
+
+        let child = delegated_child_spec(&parent).expect("delegated child spec is derived");
+        assert_eq!(child, expected);
+    }
+
+    fn sandbox_principal(sandbox_id: &str) -> crate::auth::principal::SandboxPrincipal {
+        crate::auth::principal::SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: crate::auth::principal::SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_child_requires_matching_parent_and_workspace() {
+        let state = test_server_state().await;
+        let parent = test_sandbox("delegating-parent", Vec::new());
+        state.store.put_message(&parent).await.unwrap();
+        let parent_principal = sandbox_principal(parent.object_id());
+
+        let mut child = test_sandbox("delegated-child", Vec::new());
+        child.metadata.as_mut().unwrap().labels.insert(
+            DELEGATED_PARENT_SANDBOX_LABEL.to_string(),
+            parent.object_id().to_string(),
+        );
+        ensure_delegated_child(&state, &parent_principal, &child)
+            .await
+            .expect("matching parent in the same workspace is authorized");
+
+        child.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        let err = ensure_delegated_child(&state, &parent_principal, &child)
+            .await
+            .expect_err("delegated access cannot cross workspace boundaries");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        child.metadata.as_mut().unwrap().workspace = "default".to_string();
+        child.metadata.as_mut().unwrap().labels.insert(
+            DELEGATED_PARENT_SANDBOX_LABEL.to_string(),
+            "sandbox-other".to_string(),
+        );
+        let err = ensure_delegated_child(&state, &parent_principal, &child)
+            .await
+            .expect_err("other parents cannot access this child");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn delegated_parent_can_revoke_only_a_child_ssh_session() {
+        let state = test_server_state().await;
+        let parent = test_sandbox("delegating-parent", Vec::new());
+        let mut child = test_sandbox("delegated-child", Vec::new());
+        child.metadata.as_mut().unwrap().labels.insert(
+            DELEGATED_PARENT_SANDBOX_LABEL.to_string(),
+            parent.object_id().to_string(),
+        );
+        let unrelated = test_sandbox("unrelated", Vec::new());
+        state.store.put_message(&parent).await.unwrap();
+        state.store.put_message(&child).await.unwrap();
+        state.store.put_message(&unrelated).await.unwrap();
+
+        let child_session = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox_id: child.object_id().to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let unrelated_session = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox_id: unrelated.object_id().to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let mut child_revoke = Request::new(RevokeSshSessionRequest {
+            token: child_session.token,
+        });
+        child_revoke
+            .extensions_mut()
+            .insert(Principal::Sandbox(sandbox_principal(parent.object_id())));
+        assert!(
+            handle_revoke_ssh_session(&state, child_revoke)
+                .await
+                .unwrap()
+                .into_inner()
+                .revoked
+        );
+
+        let mut unrelated_revoke = Request::new(RevokeSshSessionRequest {
+            token: unrelated_session.token,
+        });
+        unrelated_revoke
+            .extensions_mut()
+            .insert(Principal::Sandbox(sandbox_principal(parent.object_id())));
+        let error = handle_revoke_ssh_session(&state, unrelated_revoke)
+            .await
+            .expect_err("delegated parent must not revoke an unrelated SSH session");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -3028,6 +3282,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                parent_sandbox_id: String::new(),
             }),
         )
         .await
@@ -3062,6 +3317,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                parent_sandbox_id: String::new(),
             }),
         )
         .await
@@ -3086,6 +3342,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
                 workspace: String::new(),
+                parent_sandbox_id: String::new(),
             }),
         )
         .await
@@ -3146,6 +3403,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                parent_sandbox_id: String::new(),
             }),
         )
         .await
@@ -3211,6 +3469,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                parent_sandbox_id: String::new(),
             }),
         )
         .await
@@ -3241,6 +3500,7 @@ mod tests {
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                parent_sandbox_id: String::new(),
             }),
         )
         .await
@@ -3273,6 +3533,7 @@ mod tests {
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    parent_sandbox_id: String::new(),
                 }),
             )
             .await

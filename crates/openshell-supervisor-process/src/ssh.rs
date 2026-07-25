@@ -733,6 +733,7 @@ fn apply_child_env(
     ca_file_paths: Option<&(PathBuf, PathBuf)>,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
+    sandbox_id: Option<&str>,
 ) {
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
@@ -744,8 +745,19 @@ fn apply_child_env(
         .env("PATH", &path)
         .env("TERM", term);
 
+    // The sandbox id is non-secret identity, required by workloads that use a
+    // restricted delegation token to create children. Keep all credentials out.
+    if let Some(sandbox_id) = sandbox_id.filter(|id| !id.trim().is_empty()) {
+        cmd.env(openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
+    }
+
     for (key, value) in user_environment {
-        if !key.starts_with("OPENSHELL_") {
+        // The delegation-token path is intentionally workload-visible so a parent
+        // sandbox can create its own bounded worker sandboxes. Other OpenShell
+        // variables remain supervisor-only credentials or control-plane settings.
+        if !key.starts_with("OPENSHELL_")
+            || key == openshell_core::sandbox_env::DELEGATION_TOKEN_FILE
+        {
             cmd.env(key, value);
         }
     }
@@ -825,6 +837,7 @@ fn spawn_pty_shell(
     // Derive USER and HOME from the policy's run_as_user when available,
     // falling back to "sandbox" / "/sandbox" for backward compatibility.
     let (session_user, session_home) = session_user_and_home(policy);
+    let sandbox_id = std::env::var(openshell_core::sandbox_env::SANDBOX_ID).ok();
     apply_child_env(
         &mut cmd,
         &session_home,
@@ -834,6 +847,7 @@ fn spawn_pty_shell(
         ca_file_paths.as_deref(),
         provider_env,
         user_environment,
+        sandbox_id.as_deref(),
     );
     cmd.stdin(stdin).stdout(stdout).stderr(stderr);
 
@@ -979,6 +993,7 @@ fn spawn_pipe_exec(
     );
 
     let (session_user, session_home) = session_user_and_home(policy);
+    let sandbox_id = std::env::var(openshell_core::sandbox_env::SANDBOX_ID).ok();
     apply_child_env(
         &mut cmd,
         &session_home,
@@ -988,6 +1003,7 @@ fn spawn_pipe_exec(
         ca_file_paths.as_deref(),
         provider_env,
         user_environment,
+        sandbox_id.as_deref(),
     );
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1348,6 +1364,53 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[test]
+    fn apply_child_env_exposes_sandbox_identity_and_only_delegation_token_path() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdout(Stdio::piped());
+        let user_environment = HashMap::from([
+            (
+                openshell_core::sandbox_env::DELEGATION_TOKEN_FILE.to_string(),
+                openshell_core::sandbox_env::DELEGATION_TOKEN_PATH.to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
+                "/run/openshell/token".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::TLS_KEY.to_string(),
+                "/run/openshell/tls.key".to_string(),
+            ),
+        ]);
+
+        apply_child_env(
+            &mut cmd,
+            "/sandbox",
+            "sandbox",
+            "xterm-256color",
+            None,
+            None,
+            &HashMap::new(),
+            &user_environment,
+            Some("sandbox-123"),
+        );
+
+        let output = cmd.output().expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+            openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+        )));
+        assert!(stdout.contains(&format!(
+            "{}=sandbox-123",
+            openshell_core::sandbox_env::SANDBOX_ID,
+        )));
+        assert!(!stdout.contains(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE));
+        assert!(!stdout.contains(openshell_core::sandbox_env::TLS_KEY));
+    }
 
     #[cfg(unix)]
     fn file_mode(path: &Path) -> u32 {

@@ -49,6 +49,16 @@ pub struct SandboxJwtClaims {
     /// Canonical sandbox UUID, denormalized from `sub` for cheap parsing
     /// without a SPIFFE library.
     pub sandbox_id: String,
+    /// Omitted for the full supervisor credential. Delegation credentials are
+    /// separately recognized by the gateway router and have a fixed RPC scope.
+    #[serde(default)]
+    pub scope: Option<SandboxJwtScope>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxJwtScope {
+    Delegation,
 }
 
 /// Mints fresh sandbox JWTs.
@@ -100,6 +110,23 @@ impl SandboxJwtIssuer {
     /// Mint a fresh token for `sandbox_id`.
     #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
     pub fn mint(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
+        self.mint_with_scope(sandbox_id, None)
+    }
+
+    /// Mint a credential limited to delegated child operations for one parent
+    /// sandbox. Router enforcement, not a caller-supplied claim, defines its
+    /// RPC surface.
+    #[allow(clippy::result_large_err)]
+    pub fn mint_delegation(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
+        self.mint_with_scope(sandbox_id, Some(SandboxJwtScope::Delegation))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn mint_with_scope(
+        &self,
+        sandbox_id: &str,
+        scope: Option<SandboxJwtScope>,
+    ) -> Result<MintedToken, Status> {
         let now = now_secs();
         let exp = if self.ttl.is_zero() {
             0
@@ -113,6 +140,7 @@ impl SandboxJwtIssuer {
             iat: now,
             exp,
             sandbox_id: sandbox_id.to_string(),
+            scope,
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
@@ -193,9 +221,15 @@ impl SandboxJwtAuthenticator {
 
         let claims = data.claims;
         validate_exp(claims.exp)?;
+        let source = match claims.scope {
+            Some(SandboxJwtScope::Delegation) => {
+                SandboxIdentitySource::DelegationJwt { issuer: claims.iss }
+            }
+            None => SandboxIdentitySource::BootstrapJwt { issuer: claims.iss },
+        };
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id: claims.sandbox_id,
-            source: SandboxIdentitySource::BootstrapJwt { issuer: claims.iss },
+            source,
             trust_domain: Some("openshell".to_string()),
         })))
     }
@@ -302,6 +336,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_token_validates_as_delegation_principal() {
+        let (issuer, auth) = pair();
+        let minted = issuer.mint_delegation("sandbox-a").unwrap();
+        let principal = auth
+            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
+            .await
+            .unwrap()
+            .expect("expected principal");
+        assert!(matches!(
+            principal,
+            Principal::Sandbox(SandboxPrincipal {
+                source: SandboxIdentitySource::DelegationJwt { .. },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn ttl_zero_mints_non_expiring_token() {
         let (issuer, auth) = pair_with_ttl(Duration::ZERO);
         let minted = issuer.mint("sandbox-never").unwrap();
@@ -383,6 +435,7 @@ mod tests {
             iat: now_secs() - 7200,
             exp: now_secs() - 3600,
             sandbox_id: "sandbox-c".to_string(),
+            scope: None,
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(mat.kid);

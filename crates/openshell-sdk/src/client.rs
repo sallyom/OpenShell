@@ -761,6 +761,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         labels,
         annotations: HashMap::new(),
         workspace: String::new(),
+        parent_sandbox_id: String::new(),
     }
 }
 

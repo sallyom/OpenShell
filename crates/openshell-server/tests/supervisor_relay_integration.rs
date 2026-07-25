@@ -426,6 +426,12 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn issue_delegation_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::IssueDelegationTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueDelegationTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn create_workspace(
         &self,
         _: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,

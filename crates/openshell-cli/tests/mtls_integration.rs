@@ -463,6 +463,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_delegation_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueDelegationTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueDelegationTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::SupervisorMessage>>,

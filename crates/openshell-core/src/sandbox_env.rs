@@ -78,6 +78,17 @@ pub const SANDBOX_TOKEN: &str = "OPENSHELL_SANDBOX_TOKEN";
 /// the token is held in process memory thereafter.
 pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 
+/// Path where the supervisor writes a restricted credential for an explicitly
+/// opted-in workload to manage delegated child sandboxes. This never contains
+/// the supervisor's full sandbox JWT.
+pub const DELEGATION_TOKEN_FILE: &str = "OPENSHELL_DELEGATION_TOKEN_FILE";
+
+/// The only workload-visible delegation credential location accepted by the
+/// supervisor. It is separate from the private SSH runtime directory, and the
+/// fixed path prevents a sandbox specification from directing a privileged
+/// supervisor write to another mounted path.
+pub const DELEGATION_TOKEN_PATH: &str = "/run/openshell-delegation/token";
+
 /// JSON-serialized map of user-specified environment variables.
 ///
 /// Set by compute drivers from `SandboxSpec.environment`. The sandbox

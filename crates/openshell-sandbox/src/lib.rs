@@ -15,7 +15,9 @@ mod metadata_server;
 mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::Write;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
@@ -645,6 +647,19 @@ pub async fn run_sandbox(
     });
 
     let exit_code = if process_enabled {
+        if let Some(path) = delegation_token_path_from_env()? {
+            let endpoint = openshell_endpoint.as_deref().ok_or_else(|| {
+                miette::miette!(
+                    "{} requires {}",
+                    openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+                    openshell_core::sandbox_env::ENDPOINT,
+                )
+            })?;
+            let owner_uid = delegation_token_owner_uid(&policy, resolved_process_identity)?;
+            refresh_delegation_token(endpoint, &path, owner_uid).await?;
+            spawn_delegation_token_refresh(endpoint.to_string(), path, owner_uid);
+        }
+
         let ca_file_paths = networking
             .as_ref()
             .and_then(|n| n.ca_file_paths.clone())
@@ -798,6 +813,127 @@ async fn wait_for_shutdown_signal() {
 fn sidecar_network_enforcement_enabled() -> bool {
     std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE)
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
+}
+
+fn delegation_token_path_from_env() -> Result<Option<std::path::PathBuf>> {
+    let Some(path) = std::env::var(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if path != openshell_core::sandbox_env::DELEGATION_TOKEN_PATH {
+        return Err(miette::miette!(
+            "{} must be {}",
+            openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+            openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+        ));
+    }
+    Ok(Some(std::path::PathBuf::from(path)))
+}
+
+async fn refresh_delegation_token(
+    endpoint: &str,
+    path: &std::path::Path,
+    owner_uid: u32,
+) -> Result<()> {
+    let token = openshell_core::grpc_client::issue_delegation_token(endpoint).await?;
+    write_delegation_token(path, &token, owner_uid)
+}
+
+fn spawn_delegation_token_refresh(endpoint: String, path: std::path::PathBuf, owner_uid: u32) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = refresh_delegation_token(&endpoint, &path, owner_uid).await {
+                warn!(error = %error, "failed to refresh sandbox delegation token");
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn delegation_token_owner_uid(
+    policy: &SandboxPolicy,
+    resolved_identity: openshell_supervisor_process::process::ResolvedProcessIdentity,
+) -> Result<u32> {
+    if let Some(uid) = resolved_identity.uid() {
+        return Ok(uid);
+    }
+    let user = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
+    if let Ok(uid) = user.parse() {
+        return Ok(uid);
+    }
+    nix::unistd::User::from_name(user)
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("Sandbox user not found: {user}"))
+        .map(|user| user.uid.as_raw())
+}
+
+#[cfg(not(unix))]
+fn delegation_token_owner_uid(
+    _policy: &SandboxPolicy,
+    _resolved_identity: openshell_supervisor_process::process::ResolvedProcessIdentity,
+) -> Result<u32> {
+    Ok(0)
+}
+
+fn write_delegation_token(path: &std::path::Path, token: &str, owner_uid: u32) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| miette::miette!("delegation token path has no parent"))?;
+    if let Ok(metadata) = std::fs::symlink_metadata(parent)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(miette::miette!(
+            "delegation token directory must not be a symlink"
+        ));
+    }
+    std::fs::create_dir_all(parent)
+        .into_diagnostic()
+        .wrap_err("failed to create delegation token directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(parent).into_diagnostic()?.permissions();
+        permissions.set_mode(0o711);
+        std::fs::set_permissions(parent, permissions)
+            .into_diagnostic()
+            .wrap_err("failed to protect delegation token directory")?;
+    }
+    let temporary = parent.join(format!(".delegation-token-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .into_diagnostic()
+        .wrap_err("failed to create delegation token file")?;
+    #[cfg(unix)]
+    {
+        use nix::unistd::{Uid, chown};
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o400))
+            .into_diagnostic()
+            .wrap_err("failed to protect delegation token file")?;
+        chown(&temporary, Some(Uid::from_raw(owner_uid)), None)
+            .into_diagnostic()
+            .wrap_err("failed to assign delegation token to sandbox user")?;
+    }
+    file.write_all(token.as_bytes())
+        .into_diagnostic()
+        .wrap_err("failed to write delegation token")?;
+    file.write_all(b"\n")
+        .into_diagnostic()
+        .wrap_err("failed to finish delegation token")?;
+    file.sync_all()
+        .into_diagnostic()
+        .wrap_err("failed to sync delegation token")?;
+    std::fs::rename(&temporary, path)
+        .into_diagnostic()
+        .wrap_err("failed to activate delegation token")?;
+    Ok(())
 }
 
 fn process_enforcement_mode() -> ProcessEnforcementMode {
@@ -3162,6 +3298,27 @@ mod tests {
                 .is_none(),
             "process policy normalization must not mutate the network policy"
         );
+    }
+
+    #[test]
+    fn delegation_token_writer_replaces_the_previous_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delegation-token");
+        write_delegation_token(&path, "first", nix::unistd::Uid::current().as_raw()).unwrap();
+        write_delegation_token(&path, "second", nix::unistd::Uid::current().as_raw()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o711
+            );
+        }
     }
 
     #[test]

@@ -23,6 +23,13 @@ For how the CLI resolves gateways and stores credentials, refer to [Gateway Auth
 
 Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the gateway mints its own sandbox JWTs and Kubernetes sandboxes bootstrap them with a projected ServiceAccount token.
 
+To let a sandbox create and manage its own child sandboxes, opt in at creation
+time with `OPENSHELL_DELEGATION_TOKEN_FILE=/run/openshell-delegation/token`.
+The supervisor mints a separate, parent-bound delegation token at that fixed
+path and refreshes it while the sandbox runs. The workload never receives the
+supervisor JWT. The delegation token can manage only children of that parent;
+it cannot list the workspace or act as a general sandbox credential.
+
 Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
 
 Provider token grants require a SPIFFE implementation such as SPIRE and a `ClusterSPIFFEID` that assigns per-sandbox IDs from the pod's `openshell.io/sandbox-id` annotation. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens.

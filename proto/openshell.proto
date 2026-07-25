@@ -580,6 +580,15 @@ service OpenShell {
     };
   }
 
+  // Mint a short-lived credential that may manage only delegated children of
+  // the calling sandbox. The supervisor retains the full sandbox credential.
+  rpc IssueDelegationToken(IssueDelegationTokenRequest)
+      returns (IssueDelegationTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Workspace management RPCs
   // ---------------------------------------------------------------------------
@@ -676,6 +685,17 @@ message RefreshSandboxTokenResponse {
   string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the new token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
+  int64 expires_at_ms = 2;
+}
+
+// IssueDelegationToken request. The caller must hold a gateway-minted sandbox
+// JWT; Kubernetes bootstrap and delegation tokens cannot mint this credential.
+message IssueDelegationTokenRequest {}
+
+// IssueDelegationToken response. The returned JWT is limited by the gateway
+// router to delegated child lifecycle and SSH forwarding operations.
+message IssueDelegationTokenResponse {
+  string token = 1 [(openshell.options.v1.secret) = true];
   int64 expires_at_ms = 2;
 }
 
@@ -908,6 +928,9 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // Parent sandbox requesting delegated child creation. Only a sandbox
+  // principal may set this; the gateway derives ownership from identity.
+  string parent_sandbox_id = 6;
 }
 
 // Get sandbox request.

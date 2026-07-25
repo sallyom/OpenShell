@@ -348,6 +348,8 @@ pub(super) fn validate_annotations(
 /// OPENSHELL_* keys that are allowed in exec environment. The Python SDK's
 /// `exec_python()` sends a serialized callable via this key.
 const EXEC_ALLOWED_OPENSHELL_KEYS: &[&str] = &["OPENSHELL_PYFUNC_B64"];
+const SANDBOX_ALLOWED_OPENSHELL_KEYS: &[&str] =
+    &[openshell_core::sandbox_env::DELEGATION_TOKEN_FILE];
 
 /// Maximum total serialized size of user environment (bytes). The drivers
 /// serialize the full map as JSON into a single `OPENSHELL_USER_ENVIRONMENT`
@@ -365,7 +367,17 @@ fn validate_env_entries(
             "{field_name} total size exceeds {MAX_ENV_SERIALIZED_SIZE} byte limit ({total_size} bytes)"
         )));
     }
-    validate_env_entries_inner(map, field_name, &[])
+    validate_env_entries_inner(map, field_name, SANDBOX_ALLOWED_OPENSHELL_KEYS)?;
+    if let Some(path) = map.get(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE)
+        && path != openshell_core::sandbox_env::DELEGATION_TOKEN_PATH
+    {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} {} must be {}",
+            openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+            openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+        )));
+    }
+    Ok(())
 }
 
 fn validate_exec_env_entries(
@@ -1136,6 +1148,37 @@ mod tests {
             err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
             "expected reserved key error, got: {}",
             err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_fixed_delegation_token_path() {
+        let spec = SandboxSpec {
+            environment: std::iter::once((
+                openshell_core::sandbox_env::DELEGATION_TOKEN_FILE.to_string(),
+                openshell_core::sandbox_env::DELEGATION_TOKEN_PATH.to_string(),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("s", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_noncanonical_delegation_token_path() {
+        let spec = SandboxSpec {
+            environment: std::iter::once((
+                openshell_core::sandbox_env::DELEGATION_TOKEN_FILE.to_string(),
+                "/tmp/token".to_string(),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let error = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains(openshell_core::sandbox_env::DELEGATION_TOKEN_PATH)
         );
     }
 

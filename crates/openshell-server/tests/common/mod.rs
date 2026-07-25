@@ -20,11 +20,12 @@ use openshell_core::proto::{
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
+    IssueDelegationTokenRequest, IssueDelegationTokenResponse, IssueSandboxTokenRequest,
+    IssueSandboxTokenResponse, ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, ProviderResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, TcpForwardFrame,
+    UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -459,6 +460,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<RefreshSandboxTokenRequest>,
     ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn issue_delegation_token(
+        &self,
+        _request: tonic::Request<IssueDelegationTokenRequest>,
+    ) -> Result<Response<IssueDelegationTokenResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

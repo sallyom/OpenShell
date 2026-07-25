@@ -127,6 +127,8 @@ pub fn is_supervisor_only_env_var(key: &str) -> bool {
 }
 
 fn strip_supervisor_only_env(cmd: &mut Command) {
+    // The delegation-token path is intentionally workload-visible. Its file contains
+    // a parent-bound credential; the full supervisor identity remains stripped here.
     for key in SUPERVISOR_ONLY_ENV_VARS {
         cmd.env_remove(key);
     }
@@ -2580,7 +2582,11 @@ mod tests {
         cmd.stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::null())
-            .env("OPENSHELL_ENDPOINT", "https://gateway.example.test");
+            .env("OPENSHELL_ENDPOINT", "https://gateway.example.test")
+            .env(
+                openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+                openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+            );
 
         for key in SUPERVISOR_ONLY_ENV_VARS {
             cmd.env(key, format!("{key}-secret"));
@@ -2601,6 +2607,11 @@ mod tests {
             );
         }
         assert!(stdout.contains("OPENSHELL_ENDPOINT=https://gateway.example.test"));
+        assert!(stdout.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+            openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+        )));
     }
 
     #[test]

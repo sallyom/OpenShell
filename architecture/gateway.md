@@ -185,6 +185,14 @@ The config default is
 gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
 shared deployments should set a positive TTL.
 
+An opt-in parent sandbox may expose the fixed
+`OPENSHELL_DELEGATION_TOKEN_FILE=/run/openshell-delegation/token` path to its
+workload. The supervisor uses its private sandbox JWT to mint and periodically
+replace a separate delegation JWT at that path. Delegation JWTs are limited to
+parent-bound child management and SSH forwarding operations; they are not
+accepted for general supervisor or user RPCs, and do not expose the supervisor
+JWT to the workload.
+
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
 from the configured secret at startup. To rotate that key material today,

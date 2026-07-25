@@ -294,10 +294,14 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         let key_path = args.tls_key.clone().ok_or_else(|| {
             miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
         })?;
+        let require_client_auth = file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.tls.as_ref())
+            .map_or(has_client_ca && !has_oidc, |tls| tls.require_client_auth);
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
-            require_client_auth: has_client_ca && !has_oidc,
+            require_client_auth,
             client_ca_path: args.tls_client_ca.clone(),
         })
     };
@@ -1792,6 +1796,40 @@ mem_mib = "not-a-number"
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));
+    }
+
+    #[test]
+    fn server_config_preparation_respects_optional_mtls_from_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[openshell.gateway.tls]
+cert_path = "server.crt"
+key_path = "server.key"
+client_ca_path = "client-ca.crt"
+require_client_auth = false
+"#,
+        )
+        .unwrap();
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "podman",
+        ]);
+        let prepared =
+            super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
+
+        assert!(!prepared.config.tls.expect("TLS config").require_client_auth);
     }
 
     #[test]

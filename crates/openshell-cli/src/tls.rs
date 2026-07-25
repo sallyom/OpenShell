@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -42,6 +42,29 @@ pub struct TlsOptions {
     pub oidc_token: Option<String>,
     /// Skip TLS certificate verification for gateway connections.
     pub gateway_insecure: bool,
+}
+
+/// Read a sandbox bearer token supplied by the supervisor.
+///
+/// The raw environment variable remains the explicit override for test
+/// harnesses. Production supervisors project the credential as a file so the
+/// token is not copied into workload process environments.
+pub fn sandbox_token_from_environment() -> Option<String> {
+    std::env::var("OPENSHELL_SANDBOX_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            std::env::var_os("OPENSHELL_SANDBOX_TOKEN_FILE")
+                .map(PathBuf::from)
+                .as_deref()
+                .and_then(sandbox_token_from_file)
+        })
+}
+
+fn sandbox_token_from_file(path: &Path) -> Option<String> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 impl TlsOptions {
@@ -82,18 +105,22 @@ impl TlsOptions {
             .as_deref()
             .and_then(tls_dir_for_gateway)
             .or_else(|| default_tls_dir(server));
+        let env_path = |name: &str| std::env::var_os(name).map(PathBuf::from);
         Self {
             ca: self
                 .ca
                 .clone()
+                .or_else(|| env_path("OPENSHELL_TLS_CA"))
                 .or_else(|| base.as_ref().map(|dir| dir.join("ca.crt"))),
             cert: self
                 .cert
                 .clone()
+                .or_else(|| env_path("OPENSHELL_TLS_CERT"))
                 .or_else(|| base.as_ref().map(|dir| dir.join("tls.crt"))),
             key: self
                 .key
                 .clone()
+                .or_else(|| env_path("OPENSHELL_TLS_KEY"))
                 .or_else(|| base.as_ref().map(|dir| dir.join("tls.key"))),
             gateway_name: self.gateway_name.clone(),
             ..self.clone()
@@ -435,8 +462,9 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 /// interceptor that injects authentication headers on every request.
 /// Otherwise, standard mTLS is used (interceptor is a no-op).
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
-    let channel = build_channel(server, tls).await?;
-    let interceptor = interceptor_from_tls(tls)?;
+    let tls = tls.with_environment_token();
+    let channel = build_channel(server, &tls).await?;
+    let interceptor = interceptor_from_tls(&tls)?;
     Ok(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
@@ -445,7 +473,39 @@ fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
 }
 
 pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
-    let channel = build_channel(server, tls).await?;
-    let interceptor = interceptor_from_tls(tls)?;
+    let tls = tls.with_environment_token();
+    let channel = build_channel(server, &tls).await?;
+    let interceptor = interceptor_from_tls(&tls)?;
     Ok(InferenceClient::with_interceptor(channel, interceptor))
+}
+
+impl TlsOptions {
+    fn with_environment_token(&self) -> Self {
+        if self.oidc_token.is_some() {
+            return self.clone();
+        }
+        let Some(token) = sandbox_token_from_environment() else {
+            return self.clone();
+        };
+        Self {
+            oidc_token: Some(token),
+            ..self.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sandbox_token_from_file;
+
+    #[test]
+    fn sandbox_token_file_trims_file_framing_whitespace() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "  sandbox-token\n").unwrap();
+
+        assert_eq!(
+            sandbox_token_from_file(file.path()).as_deref(),
+            Some("sandbox-token")
+        );
+    }
 }

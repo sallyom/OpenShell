@@ -33,23 +33,24 @@ use openshell_core::proto::{
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
-    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
-    IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
-    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
-    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
-    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse,
-    ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage,
-    TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
-    UpdateConfigResponse, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
-    UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
+    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueDelegationTokenRequest,
+    IssueDelegationTokenResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
+    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest,
+    ListServicesResponse, ListWorkspaceMembersRequest, ListWorkspaceMembersResponse,
+    ListWorkspacesRequest, ListWorkspacesResponse, ProviderProfileResponse, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
+    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest,
+    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
+    SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -650,6 +651,13 @@ impl OpenShell for OpenShellService {
         request: Request<RefreshSandboxTokenRequest>,
     ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
         auth_rpc::handle_refresh_sandbox_token(&self.state, request).await
+    }
+
+    async fn issue_delegation_token(
+        &self,
+        request: Request<IssueDelegationTokenRequest>,
+    ) -> Result<Response<IssueDelegationTokenResponse>, Status> {
+        auth_rpc::handle_issue_delegation_token(&self.state, request).await
     }
 
     // --- Supervisor session ---

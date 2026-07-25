@@ -764,11 +764,21 @@ pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<Str
 
 pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     let map = parse_key_value_pairs(items, "--env")?;
-    for key in map.keys() {
+    for (key, value) in &map {
         if !is_valid_env_name(key) {
             return Err(miette::miette!(
                 "--env key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
             ));
+        }
+        if key == openshell_core::sandbox_env::DELEGATION_TOKEN_FILE {
+            if value != openshell_core::sandbox_env::DELEGATION_TOKEN_PATH {
+                return Err(miette::miette!(
+                    "--env {} must be {}",
+                    openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+                    openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+                ));
+            }
+            continue;
         }
         if key.starts_with("OPENSHELL_") {
             return Err(miette::miette!(

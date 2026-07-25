@@ -24,11 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
-    open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueDelegationTokenRequest,
+    IssueSandboxTokenRequest, NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus,
+    RefreshSandboxTokenRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
+    inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -319,6 +319,19 @@ async fn acquire_k8s_sandbox_token(
 /// long-lived `supervisor_session` control stream).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
+}
+
+/// Mint a child-management-only credential using the supervisor's refreshable
+/// gateway JWT. Callers must persist only the returned restricted token.
+pub async fn issue_delegation_token(endpoint: &str) -> Result<String> {
+    let channel = connect_channel(endpoint).await?;
+    let mut client = OpenShellClient::new(channel);
+    let response = client
+        .issue_delegation_token(IssueDelegationTokenRequest {})
+        .await
+        .into_diagnostic()
+        .wrap_err("IssueDelegationToken failed")?;
+    Ok(response.into_inner().token)
 }
 
 /// Background task that renews the sandbox JWT at ~80% of its remaining

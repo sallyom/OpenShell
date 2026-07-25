@@ -655,6 +655,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_delegation_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueDelegationTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueDelegationTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
@@ -1935,6 +1942,32 @@ async fn sandbox_create_env_rejects_reserved_prefix() {
         msg.contains("OPENSHELL_") && msg.contains("reserved"),
         "error should mention reserved prefix, got: {msg}"
     );
+}
+
+#[tokio::test]
+async fn sandbox_create_env_accepts_fixed_delegation_token_path() {
+    let environment = run::parse_env_pairs(&[format!(
+        "{}={}",
+        openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+        openshell_core::sandbox_env::DELEGATION_TOKEN_PATH,
+    )])
+    .unwrap();
+    assert_eq!(
+        environment
+            .get(openshell_core::sandbox_env::DELEGATION_TOKEN_FILE)
+            .map(String::as_str),
+        Some(openshell_core::sandbox_env::DELEGATION_TOKEN_PATH),
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_env_rejects_noncanonical_delegation_token_path() {
+    let error = run::parse_env_pairs(&[format!(
+        "{}=/tmp/token",
+        openshell_core::sandbox_env::DELEGATION_TOKEN_FILE,
+    )])
+    .unwrap_err();
+    assert!(format!("{error}").contains(openshell_core::sandbox_env::DELEGATION_TOKEN_PATH));
 }
 
 #[tokio::test]

@@ -84,3 +84,19 @@ impl tonic::service::Interceptor for EdgeAuthInterceptor {
         Ok(req)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::EdgeAuthInterceptor;
+    use tonic::service::Interceptor;
+
+    #[test]
+    fn oidc_token_is_injected_as_bearer_header() {
+        let mut interceptor = EdgeAuthInterceptor::new(Some("jwt-token"), None).unwrap();
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer jwt-token"
+        );
+    }
+}

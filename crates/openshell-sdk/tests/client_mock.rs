@@ -618,6 +618,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn issue_delegation_token(
+        &self,
+        _: tonic::Request<proto::IssueDelegationTokenRequest>,
+    ) -> Result<Response<proto::IssueDelegationTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_workspace(
         &self,
         request: tonic::Request<proto::CreateWorkspaceRequest>,
