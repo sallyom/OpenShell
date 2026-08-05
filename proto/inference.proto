@@ -32,10 +32,14 @@ service Inference {
   }
 
   // Get the inference route for a workspace.
+  //
+  // Sandbox callers can read only the provider/model/version metadata for their
+  // own workspace. The resolved bundle, which contains credentials, remains
+  // sandbox-only.
   rpc GetInferenceRoute(GetInferenceRouteRequest)
       returns (GetInferenceRouteResponse) {
     option (openshell.options.v1.authorization) = {
-      auth_mode: "bearer"
+      auth_mode: "dual"
       scope: "inference:read"
       workspace_role: "user"
     };

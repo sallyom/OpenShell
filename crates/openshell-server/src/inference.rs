@@ -141,18 +141,48 @@ impl Inference for InferenceService {
     ) -> Result<Response<GetInferenceRouteResponse>, Status> {
         let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
-        let authz = authorize_workspace(
-            &self.state.store,
-            &self.state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
-        let workspace =
-            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &authz.workspace)
+        let workspace = match &principal {
+            crate::auth::principal::Principal::Sandbox(sandbox_principal) => {
+                let sandbox: Sandbox = self
+                    .state
+                    .store
+                    .get_message::<Sandbox>(&sandbox_principal.sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .ok_or_else(|| {
+                        Status::not_found(format!(
+                            "sandbox '{}' not found",
+                            sandbox_principal.sandbox_id
+                        ))
+                    })?;
+                let workspace = sandbox.object_workspace();
+                if !req.workspace.trim().is_empty() && req.workspace.trim() != workspace {
+                    return Err(Status::permission_denied(
+                        "sandbox principals may only read inference routes in their own workspace",
+                    ));
+                }
+                workspace.to_string()
+            }
+            crate::auth::principal::Principal::User(_) => {
+                let authz = authorize_workspace(
+                    &self.state.store,
+                    &self.state.admin_role,
+                    &principal,
+                    &req.workspace,
+                    MinWorkspaceRole::User,
+                )
+                .await?;
+                crate::grpc::workspace::resolve_workspace(
+                    self.state.store.as_ref(),
+                    &authz.workspace,
+                )
                 .await?
-                .name;
+                .name
+            }
+            crate::auth::principal::Principal::Anonymous => {
+                return Err(Status::unauthenticated("authentication required"));
+            }
+        };
         let route_name = effective_route_name(&req.route_name)?;
         let route = self
             .state
@@ -3504,5 +3534,77 @@ mod tests {
             "delete_inference_route should return PermissionDenied, got {:?}",
             err.code()
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_reads_only_its_workspace_inference_route_metadata() {
+        use crate::grpc::test_support::test_server_state;
+        use openshell_core::proto::inference_server::Inference;
+
+        let state = test_server_state().await;
+        let svc = InferenceService::new(state.clone());
+
+        let provider = make_provider("openrouter", "openai", "OPENAI_API_KEY", "test-key");
+        state
+            .store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+        upsert_inference_route(
+            &state.store,
+            "default",
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openrouter",
+            "thinkingmachines/inkling",
+            0,
+            false,
+        )
+        .await
+        .expect("persist route");
+
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-a".to_string(),
+                name: "parent".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("persist sandbox");
+
+        let mut request = Request::new(GetInferenceRouteRequest {
+            workspace: "default".to_string(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(test_sandbox_principal());
+        let response = svc
+            .get_inference_route(request)
+            .await
+            .expect("sandbox should read its route metadata")
+            .into_inner();
+        assert_eq!(response.provider_name, "openrouter");
+        assert_eq!(response.model_id, "thinkingmachines/inkling");
+
+        let mut cross_workspace = Request::new(GetInferenceRouteRequest {
+            workspace: "other".to_string(),
+            ..Default::default()
+        });
+        cross_workspace
+            .extensions_mut()
+            .insert(test_sandbox_principal());
+        let err = svc
+            .get_inference_route(cross_workspace)
+            .await
+            .expect_err("sandbox must not read another workspace route");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 }

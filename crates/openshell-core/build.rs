@@ -22,23 +22,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
-    // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
-    // does not bundle the well-known type includes (google/protobuf/struct.proto
-    // etc.), so we must use protobuf-src which ships both the binary and the
-    // include tree.
-    // SAFETY: This is run at build time in a single-threaded build script context.
-    // No other threads are reading environment variables concurrently.
-    #[allow(unsafe_code)]
-    unsafe {
-        env::set_var("PROTOC", protobuf_src::protoc());
+    println!("cargo:rerun-if-env-changed=PROTOC");
+    println!("cargo:rerun-if-env-changed=PROTOC_INCLUDE");
+    // A cross-build supplies a native protoc explicitly: the target-built
+    // protobuf-src executable cannot run in the host build-script process.
+    // Ordinary builds retain the bundled compiler and its well-known includes.
+    if env::var_os("PROTOC").is_none() {
+        // SAFETY: This runs in the single-threaded build-script process.
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("PROTOC", protobuf_src::protoc());
+        }
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
+    let mut proto_include_paths = vec![proto_root.clone()];
+    if let Some(protoc_include) = env::var_os("PROTOC_INCLUDE") {
+        proto_include_paths.push(PathBuf::from(protoc_include));
+    }
 
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
+    for proto_file in &proto_files {
+        println!("cargo:rerun-if-changed={}", proto_file.display());
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let descriptor_path = out_dir.join("openshell_descriptor.bin");
@@ -50,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&proto_files, &[proto_root])?;
+        .compile_protos(&proto_files, &proto_include_paths)?;
 
     println!(
         "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",

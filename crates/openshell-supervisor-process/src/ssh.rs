@@ -26,11 +26,15 @@ use russh::{ChannelId, CryptoVec};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::net::UnixListener;
+#[cfg(unix)]
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Perform SSH server initialization: generate a host key, build the config,
@@ -238,6 +242,17 @@ struct ChannelState {
     pty_request: Option<PtyRequest>,
 }
 
+/// One reverse Unix-socket listener owned by this SSH connection.
+///
+/// The inode identity prevents cleanup from unlinking a path replaced after
+/// the listener was bound.
+#[cfg(unix)]
+struct ForwardedStreamLocal {
+    task: JoinHandle<()>,
+    device: u64,
+    inode: u64,
+}
+
 struct SshHandler {
     policy: SandboxPolicy,
     workdir: Option<String>,
@@ -249,6 +264,8 @@ struct SshHandler {
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     channels: HashMap<ChannelId, ChannelState>,
+    #[cfg(unix)]
+    forwarded_streamlocals: HashMap<PathBuf, ForwardedStreamLocal>,
 }
 
 impl SshHandler {
@@ -275,6 +292,18 @@ impl SshHandler {
             resolved_identity,
             enforcement_mode,
             channels: HashMap::new(),
+            #[cfg(unix)]
+            forwarded_streamlocals: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        for (socket_path, listener) in self.forwarded_streamlocals.drain() {
+            listener.task.abort();
+            remove_owned_worker_reverse_socket(&socket_path, listener.device, listener.inode);
         }
     }
 }
@@ -388,6 +417,144 @@ impl russh::server::Handler for SshHandler {
         });
 
         Ok(true)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        #[cfg(not(unix))]
+        {
+            let _ = (socket_path, session);
+            return Ok(false);
+        }
+
+        #[cfg(unix)]
+        {
+            let socket_path = PathBuf::from(socket_path);
+            if !is_worker_reverse_socket_path(&socket_path)
+                || self.forwarded_streamlocals.contains_key(&socket_path)
+            {
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .message(format!(
+                            "streamlocal-forward rejected for {}",
+                            socket_path.display()
+                        ))
+                        .build()
+                );
+                return Ok(false);
+            }
+
+            let Some(parent) = socket_path.parent() else {
+                return Ok(false);
+            };
+            let parent_metadata = match std::fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+                _ => return Ok(false),
+            };
+            if parent_metadata.permissions().mode() & 0o077 != 0 {
+                return Ok(false);
+            }
+            if std::fs::symlink_metadata(&socket_path).is_ok() {
+                return Ok(false);
+            }
+
+            let listener = match UnixListener::bind(&socket_path) {
+                Ok(listener) => listener,
+                Err(_) => return Ok(false),
+            };
+            if std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+                .is_err()
+            {
+                drop(listener);
+                let _ = std::fs::remove_file(&socket_path);
+                return Ok(false);
+            }
+            let metadata = match std::fs::symlink_metadata(&socket_path) {
+                Ok(metadata) if metadata.file_type().is_socket() => metadata,
+                _ => {
+                    drop(listener);
+                    let _ = std::fs::remove_file(&socket_path);
+                    return Ok(false);
+                }
+            };
+            let device = metadata.dev();
+            let inode = metadata.ino();
+            let handle = session.handle();
+            let forwarded_path = socket_path.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let handle = handle.clone();
+                    let forwarded_path = forwarded_path.clone();
+                    tokio::spawn(async move {
+                        let Ok(channel) = handle
+                            .channel_open_forwarded_streamlocal(
+                                forwarded_path.to_string_lossy().into_owned(),
+                            )
+                            .await
+                        else {
+                            return;
+                        };
+                        let mut channel = channel.into_stream();
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut channel).await;
+                    });
+                }
+            });
+            self.forwarded_streamlocals.insert(
+                socket_path.clone(),
+                ForwardedStreamLocal {
+                    task,
+                    device,
+                    inode,
+                },
+            );
+            ocsf_emit!(
+                SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Listen)
+                    .action(ActionId::Allowed)
+                    .disposition(DispositionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .message(format!(
+                        "streamlocal-forward listening on {}",
+                        socket_path.display()
+                    ))
+                    .build()
+            );
+            Ok(true)
+        }
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        #[cfg(not(unix))]
+        {
+            let _ = socket_path;
+            return Ok(false);
+        }
+
+        #[cfg(unix)]
+        {
+            let socket_path = PathBuf::from(socket_path);
+            let Some(listener) = self.forwarded_streamlocals.remove(&socket_path) else {
+                return Ok(false);
+            };
+            listener.task.abort();
+            remove_owned_worker_reverse_socket(&socket_path, listener.device, listener.inode);
+            Ok(true)
+        }
     }
 
     async fn pty_request(
@@ -621,6 +788,45 @@ impl SshHandler {
             state.input_sender = Some(input_sender);
         }
         Ok(())
+    }
+}
+
+/// Only OpenClaw's worker tunnel path is eligible for reverse forwarding.
+/// This prevents a sandbox SSH client from creating a listener at an arbitrary
+/// filesystem location or using the supervisor as a generic forwarding host.
+#[cfg(unix)]
+fn is_worker_reverse_socket_path(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let Some((directory, socket_name)) = path.rsplit_once('/') else {
+        return false;
+    };
+    if socket_name != "gateway.sock" {
+        return false;
+    }
+    let Some(worker) = directory.strip_prefix("/tmp/ocw-") else {
+        return false;
+    };
+    let Some((environment, epoch)) = worker.rsplit_once('-') else {
+        return false;
+    };
+    environment.len() == 16
+        && environment
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && !epoch.is_empty()
+        && epoch.bytes().all(|byte| byte.is_ascii_digit())
+        && epoch.parse::<u64>().is_ok()
+}
+
+#[cfg(unix)]
+fn remove_owned_worker_reverse_socket(path: &Path, device: u64, inode: u64) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_socket() && metadata.dev() == device && metadata.ino() == inode {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1628,6 +1834,28 @@ mod tests {
         assert!(!is_loopback_host(""));
         assert!(!is_loopback_host("not-an-ip"));
         assert!(!is_loopback_host("[]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_reverse_socket_path_only_accepts_openclaw_tunnel_paths() {
+        assert!(is_worker_reverse_socket_path(Path::new(
+            "/tmp/ocw-0123456789abcdef-3/gateway.sock"
+        )));
+        for path in [
+            "/tmp/ocw-0123456789abcdef-3/other.sock",
+            "/tmp/ocw-0123456789abcdef-3/../gateway.sock",
+            "/tmp/ocw-0123456789abcdef-3/gateway.sock/extra",
+            "/tmp/ocw-0123456789ABCDEf-3/gateway.sock",
+            "/tmp/ocw-0123456789abcde-3/gateway.sock",
+            "/tmp/ocw-0123456789abcdef-x/gateway.sock",
+            "/var/tmp/ocw-0123456789abcdef-3/gateway.sock",
+        ] {
+            assert!(
+                !is_worker_reverse_socket_path(Path::new(path)),
+                "unexpectedly accepted {path}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

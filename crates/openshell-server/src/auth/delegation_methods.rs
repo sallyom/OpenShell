@@ -18,7 +18,7 @@ pub fn is_delegation_callable(path: &str) -> bool {
             | "/openshell.v1.OpenShell/CreateSshSession"
             | "/openshell.v1.OpenShell/RevokeSshSession"
             | "/openshell.v1.OpenShell/ForwardTcp"
-            | "/openshell.v1.Inference/GetInferenceRoute"
+            | "/openshell.inference.v1.Inference/GetInferenceRoute"
     )
 }
 
@@ -33,6 +33,9 @@ mod tests {
         ));
         assert!(is_delegation_callable("/openshell.v1.OpenShell/ForwardTcp"));
         assert!(is_delegation_callable(
+            "/openshell.inference.v1.Inference/GetInferenceRoute"
+        ));
+        assert!(!is_delegation_callable(
             "/openshell.v1.Inference/GetInferenceRoute"
         ));
         assert!(!is_delegation_callable(
