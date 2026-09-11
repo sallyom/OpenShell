@@ -69,6 +69,11 @@ public_phase =
   if backend_phase in {Provisioning, Unknown} && no session: → Provisioning
 ```
 
+A false readiness condition represents provisioning while its reason describes a
+runtime transition, including Agent Sandbox suspension. Only terminal failure
+reasons move the backend to `Error`; an affirmative suspended condition moves it
+to `Stopped`.
+
 For a supervisor-controlled runtime, `public_phase == Ready` means both the
 backend resource is healthy and a supervisor session is registered. A sandbox whose
 backend reports ready but has no supervisor session yet holds `Provisioning` with a

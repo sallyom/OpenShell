@@ -4685,6 +4685,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "containercreated",
         "healthcheckstarting",
         "inspectfailed",
+        "sandboxsuspended",
     ];
     !transient_reasons.contains(&reason.as_str())
 }
@@ -6515,6 +6516,10 @@ mod tests {
                 "ContainerCreated",
                 "Podman created the container before starting it",
             ),
+            (
+                "SandboxSuspended",
+                "Agent Sandbox is transitioning its backing Pod",
+            ),
         ];
 
         for (reason, message) in transient_cases {
@@ -6555,6 +6560,10 @@ mod tests {
             (
                 "ContainerCreated",
                 "Container exists but has not started yet",
+            ),
+            (
+                "SandboxSuspended",
+                "Agent Sandbox is transitioning its backing Pod",
             ),
         ];
 
@@ -7867,6 +7876,56 @@ mod tests {
             SandboxPhase::Ready as i32,
             "a resumed, Ready sandbox must not stay Starting because of a stale Suspended condition"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_suspended_readiness_transition_reaches_ready() {
+        // Agent Sandbox can briefly report Ready=False (SandboxSuspended) while
+        // provisioning its backing Pod. That transition must remain recoverable
+        // so the subsequent ready snapshot can advance the public sandbox.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record(
+            "sb-suspended-transition",
+            "sandbox-suspended-transition",
+            SandboxPhase::Provisioning,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let mut suspended = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        suspended.status = Some(make_driver_status(make_driver_condition(
+            "SandboxSuspended",
+            "Sandbox is waiting for its backing Pod",
+        )));
+        runtime.apply_sandbox_update(suspended).await.unwrap();
+
+        let provisioning = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            provisioning.phase(),
+            SandboxPhase::Provisioning as i32,
+            "a recoverable Agent Sandbox transition must not become terminal"
+        );
+
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox(
+                sandbox.object_id(),
+                sandbox.object_name(),
+            ))
+            .await
+            .unwrap();
+
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
     }
 
     #[tokio::test]
